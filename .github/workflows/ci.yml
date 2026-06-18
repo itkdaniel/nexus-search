@@ -1,0 +1,85 @@
+name: CI — nexus-search
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  unit-tests:
+    name: Unit Tests (algorithms, BM25, TagGraph)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Run unit tests
+        run: pytest tests/unit/ -v --tb=short
+
+  ddt-tests:
+    name: DDT — Hypothesis Property Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+      - run: pip install -r requirements-dev.txt
+      - name: Run Hypothesis DDT tests
+        run: pytest tests/ddt/ -v --tb=short
+
+  bdd-tests:
+    name: BDD — pytest-bdd Scenarios
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+      - run: pip install -r requirements-dev.txt
+      - name: Run BDD tests
+        run: pytest tests/bdd/ -v --tb=short
+
+  regression-tests:
+    name: Regression — API Contract Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+      - run: pip install -r requirements-dev.txt
+      - name: Run regression tests
+        run: pytest tests/regression/ -v --tb=short
+
+  e2e-tests:
+    name: E2E — Full Search Flow Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+      - run: pip install -r requirements-dev.txt
+      - name: Run E2E tests
+        run: pytest tests/e2e/ -v --tb=short
+
+  docker-build:
+    name: Docker Build Verification
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build Docker image
+        run: docker build -t nexus-search:ci .
