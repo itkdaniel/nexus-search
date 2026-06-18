@@ -46,7 +46,7 @@ async def unified_search(
     cache_key = f"search:q:{q}:tags:{tags}:pub:{published}:lim:{limit}"
 
     cached = await cache.get(cache_key)
-    if cached:
+    if cached is not None:
         return cached
 
     async with get_db() as db:
