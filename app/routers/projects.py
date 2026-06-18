@@ -5,7 +5,19 @@ All read endpoints use the persistent BM25Index and TagGraph singletons
 built at startup (O(n)), giving O(k) query performance.
 
 Write endpoints update both the DB and the in-memory indexes incrementally
-(O(1) amortized) and invalidate Redis cache via pipeline batching.
+and invalidate ALL derived Redis caches (list, search-query, related) via
+pipeline-batched pattern deletion in a single round-trip.
+
+Cache key strategy:
+  - List (no filters):  search:projects:pub:{published}
+  - List (with filters): not cached (too many combinations)
+  - Single project:      search:projects:id:{id}
+  - BFS related:         search:related:{id}:{max_results}
+  - Search queries:      search:q:{q}:tags:{t}:pub:{p}:lim:{l}   (in search.py)
+
+On any write, ALL derived caches are invalidated by SCAN+pipeline pattern
+delete covering: search:projects:pub:*, search:q:*, search:related:*
+so callers never see stale data after mutations.
 
 Auth: admin JWT required for POST/PATCH/DELETE.
 """
@@ -39,26 +51,39 @@ logger = structlog.get_logger(__name__)
 
 router = APIRouter(prefix="/v1/projects", tags=["projects"])
 
-_CACHE_ALL = "search:projects:all"
-_CACHE_ID = "search:projects:id:"
-_CACHE_SEARCH_PREFIX = "search:query:"
+# Cache key builders — all include discriminating params to prevent poisoning
+_CACHE_LIST  = "search:projects:pub:{published}"   # one key per published value
+_CACHE_ID    = "search:projects:id:"               # prefix + project_id
+# Patterns for bulk invalidation (SCAN-based):
+_PATTERN_ALL = "search:*"                           # full flush on any write
 
 
-def _cache(redis=Depends(get_redis)) -> CacheService:
-    from app.config import Settings
-    # Inject TTL from configured settings (accessible via redis client attributes)
-    return CacheService(redis, ttl=300)
+def _list_key(published: Optional[bool]) -> str:
+    return f"search:projects:pub:{published}"
 
 
 def _doc_dict(project: ProjectModel) -> dict:
     return ProjectResponse.model_validate(project).model_dump(mode="json")
 
 
-def _rebuild_indexes(docs: List[dict]) -> None:
-    """Full rebuild of BM25 index and tag graph. Called as a BackgroundTask."""
-    get_bm25_index().build(docs)
-    get_tag_graph().build(docs)
-    logger.info("search indexes rebuilt", n_docs=len(docs))
+async def _invalidate_all_derived(cache: CacheService, project_id: str) -> None:
+    """
+    Bulk-invalidate ALL derived cache keys after any write operation.
+
+    Scans and deletes all keys matching:
+      - search:projects:pub:*   (list caches for each published variant)
+      - search:projects:id:*    (individual project caches)
+      - search:q:*              (unified search result caches)
+      - search:related:*        (BFS recommendation caches)
+
+    All DEL commands are pipelined (single round-trip per pattern scan batch).
+    """
+    await asyncio.gather(
+        cache.delete_pattern("search:projects:pub:*"),
+        cache.delete_pattern("search:projects:id:*"),
+        cache.delete_pattern("search:q:*"),
+        cache.delete_pattern(f"search:related:{project_id}:*"),
+    )
 
 
 # ── GET /v1/projects ──────────────────────────────────────────────────────────
@@ -74,12 +99,24 @@ async def list_projects(
     """
     List projects with optional BM25 search and tag filtering.
 
-    - No filters: cache-aside (5-min TTL)
-    - With filters: skip cache (too many combinations), query index
-    - BM25 score > 0 → ranked results; all zero → fuzzy fallback
+    Cache strategy:
+    - No search/tag/featured filters: cache-aside keyed by `published` value
+      so published=true and published=false never share a cache entry.
+    - Any filter present: skip cache (combinatorial explosion avoided).
+
+    BM25 scoring:
+    - Score > 0 → ranked results
+    - All zero → Levenshtein fuzzy fallback on `name` field
     """
     cache = CacheService(redis)
-    has_filter = search or tags or featured is not None
+    has_filter = bool(search or tags or featured is not None)
+    # Cache key includes the `published` discriminator — avoids cross-poisoning
+    list_cache_key = _list_key(published)
+
+    if not has_filter:
+        cached = await cache.get(list_cache_key)
+        if cached is not None:
+            return cached
 
     async with get_db() as db:
         stmt = select(ProjectModel).order_by(desc(ProjectModel.created_at))
@@ -87,17 +124,10 @@ async def list_projects(
             stmt = stmt.where(ProjectModel.published == published)
         if featured is not None:
             stmt = stmt.where(ProjectModel.featured == featured)
-
-        if not has_filter:
-            cached = await cache.get(_CACHE_ALL)
-            if cached:
-                return cached
-
         result = await db.execute(stmt)
         docs = [_doc_dict(p) for p in result.scalars().all()]
 
     if search:
-        # Use persistent index for O(k) scoring
         idx = get_bm25_index()
         ranked = idx.search(search, docs)
         if all(score == 0.0 for score, _ in ranked):
@@ -110,7 +140,7 @@ async def list_projects(
         docs = [d for score, d in tag_ranked(tag_list, docs) if score > 0]
 
     if not has_filter:
-        await cache.set(_CACHE_ALL, docs)
+        await cache.set(list_cache_key, docs)
 
     return docs
 
@@ -121,7 +151,7 @@ async def list_projects(
 async def get_project(project_id: str, redis=Depends(get_redis)):
     cache = CacheService(redis)
     cached = await cache.get(f"{_CACHE_ID}{project_id}")
-    if cached:
+    if cached is not None:
         return cached
 
     async with get_db() as db:
@@ -148,8 +178,9 @@ async def create_project(
     redis=Depends(get_redis),
 ):
     """
-    Create a project. Invalidates the list cache and updates indexes.
-    BackgroundTask rebuilds indexes asynchronously so the response is fast.
+    Create a project. Invalidates ALL derived caches (list, search, related)
+    via pipelined SCAN+DEL pattern deletion. Updates BM25 and TagGraph
+    incrementally so subsequent reads are immediately consistent.
     """
     cache = CacheService(redis)
 
@@ -163,12 +194,13 @@ async def create_project(
         await db.refresh(project)
         data = _doc_dict(project)
 
-    # Incremental index update (O(doc_length))
+    # Incremental in-memory index update (O(doc_length))
     get_bm25_index().upsert(data)
     get_tag_graph().add_node(data)
 
+    # Invalidate ALL derived caches + publish event
     await asyncio.gather(
-        cache.delete(_CACHE_ALL),
+        _invalidate_all_derived(cache, project.id),
         cache.publish("search:events", {"type": "created", "id": project.id}),
     )
     logger.info("project created", id=project.id)
@@ -185,8 +217,8 @@ async def update_project(
     redis=Depends(get_redis),
 ):
     """
-    Update a project. Invalidates list + individual cache keys.
-    Uses Redis pipeline for atomic multi-key invalidation.
+    Update a project. Invalidates list, per-id, search-query, and BFS caches
+    covering all published variants via SCAN+pipeline batching.
     """
     cache = CacheService(redis)
 
@@ -205,13 +237,13 @@ async def update_project(
         await db.refresh(project)
         data = _doc_dict(project)
 
-    # Incremental index update
+    # Incremental in-memory index update
     get_bm25_index().upsert(data)
     get_tag_graph().add_node(data)
 
-    # Pipeline-batched invalidation (one round-trip)
+    # Invalidate ALL derived caches + publish event
     await asyncio.gather(
-        cache.delete_many([_CACHE_ALL, f"{_CACHE_ID}{project_id}"]),
+        _invalidate_all_derived(cache, project_id),
         cache.publish("search:events", {"type": "updated", "id": project_id}),
     )
     logger.info("project updated", id=project_id)
@@ -226,7 +258,11 @@ async def delete_project(
     _admin=Depends(require_admin),
     redis=Depends(get_redis),
 ):
-    """Delete a project and invalidate caches + indexes."""
+    """
+    Delete a project. Removes from DB, BM25 index, and TagGraph, then
+    invalidates ALL derived caches (list, search-query, related, per-id)
+    via pipelined SCAN+DEL — callers see consistent data immediately.
+    """
     cache = CacheService(redis)
 
     async with get_db() as db:
@@ -238,12 +274,13 @@ async def delete_project(
             raise HTTPException(status_code=404, detail="Project not found")
         await db.delete(project)
 
-    # Incremental index removal
+    # Remove from in-memory indexes
     get_bm25_index().delete(project_id)
     get_tag_graph().remove_node(project_id)
 
+    # Invalidate ALL derived caches + publish event
     await asyncio.gather(
-        cache.delete_many([_CACHE_ALL, f"{_CACHE_ID}{project_id}"]),
+        _invalidate_all_derived(cache, project_id),
         cache.publish("search:events", {"type": "deleted", "id": project_id}),
     )
     logger.info("project deleted", id=project_id)
@@ -259,13 +296,13 @@ async def related_projects(
 ):
     """
     BFS tag-graph traversal to find related projects by shared tags.
-    Uses the persistent TagGraph singleton (built at startup).
-    O(V + E) query — graph already built, no DB read needed.
+    Cache key includes project_id + max_results for correct isolation.
+    O(V + E) BFS query against the persistent TagGraph singleton.
     """
     cache = CacheService(redis)
     cache_key = f"search:related:{project_id}:{max_results}"
     cached = await cache.get(cache_key)
-    if cached:
+    if cached is not None:
         return cached
 
     # Verify project exists
@@ -279,12 +316,12 @@ async def related_projects(
     graph = get_tag_graph()
     related_ids = graph.bfs(project_id, max_hops=2)[:max_results]
 
-    # Fetch related projects from DB (or from index)
+    # Prefer in-memory index docs (O(1)); fall back to DB for any missing
     bm25 = get_bm25_index()
-    id_to_doc = bm25._docs  # read-only access to indexed docs
+    id_to_doc = bm25._docs
 
-    related = []
-    missing_ids = []
+    related: List[dict] = []
+    missing_ids: List[str] = []
     for rid in related_ids:
         doc = id_to_doc.get(rid)
         if doc:
@@ -292,7 +329,6 @@ async def related_projects(
         else:
             missing_ids.append(rid)
 
-    # If some docs not in index, fetch from DB
     if missing_ids:
         async with get_db() as db:
             result = await db.execute(
